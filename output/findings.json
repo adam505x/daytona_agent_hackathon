@@ -1,0 +1,28 @@
+[
+  {
+    "_comment": "Schema definition — this array will be populated by red_team.py",
+    "_schema": {
+      "id":         "string  — UUID v4 unique to this finding",
+      "type":       "string  — technique used: sqli | path_traversal | file_upload | brute_force | ssh_brute | mysql_anon | curl_probe",
+      "severity":   "string  — critical | high | medium | low",
+      "target":     "string  — ip:port/path (e.g. '10.0.0.5:80/login.php')",
+      "success":    "boolean — true if exploitation produced evidence of compromise",
+      "technique":  "string  — same as type, explicit tool used",
+      "evidence": {
+        "raw_snippet":      "string  — first 2000 chars of tool output",
+        "dumped_tables":    "string[] — table names extracted by sqlmap",
+        "dumped_data_sample": "string  — sample of retrieved data",
+        "passwd_leaked":    "boolean — true if /etc/passwd was readable",
+        "credentials":      "string[] — cracked credential lines from hydra",
+        "databases":        "string[] — database names from mysql",
+        "sql_error":        "boolean — true if a SQL error was triggered"
+      },
+      "raw_output":       "string  — full stdout+stderr from the exploit tool (capped 5000 chars)",
+      "sandbox_id":       "string  — Daytona sandbox UUID that produced this finding",
+      "depth":            "integer — recursion depth (0 = first wave, max MAX_DEPTH)",
+      "deeper_vectors":   "object[] — additional vectors spawned from this finding",
+      "error":            "string | null — non-null if the sandbox command failed",
+      "timestamp":        "string  — ISO-8601 UTC timestamp"
+    }
+  }
+]

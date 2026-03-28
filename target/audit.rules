@@ -1,0 +1,47 @@
+## OpenClaw audit rules — capture all syscall activity relevant to web exploitation
+
+# Delete all existing rules first
+-D
+
+# Set buffer size large enough for busy targets
+-b 8192
+
+# Failure mode: 1 = print to syslog, 2 = panic kernel (use 1 for lab)
+-f 1
+
+# ── File access monitoring ────────────────────────────────────────────────────
+# Watch sensitive files that are commonly read during path traversal
+-w /etc/passwd   -p r -k path_traversal
+-w /etc/shadow   -p r -k path_traversal
+-w /etc/hosts    -p r -k path_traversal
+-w /proc/self    -p r -k proc_read
+
+# Watch the DVWA webroot for writes (file upload exploits)
+-w /var/www/html -p w -k webroot_write
+-w /var/www/html -p x -k webroot_exec
+
+# Watch Apache log directory for tampering
+-w /var/log/apache2 -p wa -k log_tamper
+
+# ── Process execution ─────────────────────────────────────────────────────────
+# Any exec from Apache worker (uid 33 = www-data on Debian)
+-a always,exit -F arch=b64 -F uid=33 -S execve -k www_exec
+-a always,exit -F arch=b32 -F uid=33 -S execve -k www_exec
+
+# Shell spawns from any user
+-a always,exit -F arch=b64 -S execve -F exe=/bin/sh  -k shell_spawn
+-a always,exit -F arch=b64 -S execve -F exe=/bin/bash -k shell_spawn
+-a always,exit -F arch=b64 -S execve -F exe=/usr/bin/python3 -k python_exec
+
+# ── Network connections ───────────────────────────────────────────────────────
+# Track outbound connections (reverse shells)
+-a always,exit -F arch=b64 -S connect -k net_connect
+-a always,exit -F arch=b32 -S connect -k net_connect
+
+# ── Privilege escalation ──────────────────────────────────────────────────────
+-w /usr/bin/sudo -p x -k sudo_exec
+-w /bin/su       -p x -k su_exec
+-a always,exit -F arch=b64 -S setuid -S setgid -k setuid
+
+# Make the configuration immutable for the session (-e 2 would require reboot to change)
+# Leave mutable for lab use: -e 2
