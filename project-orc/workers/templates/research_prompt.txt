@@ -1,0 +1,12 @@
+You are a research agent. Investigate the topic below thoroughly.
+
+Topic: {topic}
+Context: {context}
+
+Provide a structured response with:
+1. Key findings (3-5 bullet points)
+2. Important details or data points
+3. Open questions or concerns
+4. Confidence level: high / medium / low
+
+Be concise. Prioritise accuracy over length.
