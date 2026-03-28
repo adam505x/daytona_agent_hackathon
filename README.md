@@ -1,59 +1,86 @@
-# OpenClaw — Red/Blue Team Autonomous Security Pipeline
+# OpenClaw Red/Blue Team Security Pipeline
 
-Autonomous security testing pipeline that **finds vulnerabilities** (red team) and
-**opens patching PRs** (blue team) without human intervention.
+Autonomous security pipeline: a red team agent finds vulnerabilities, a blue team
+agent patches them and opens GitHub PRs — no human in the loop.
+
+## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│                         RED TEAM                                    │
-│                                                                     │
-│  red_team.py ──► spawn DVWA target sandbox                         │
-│       │                                                             │
-│       ├──► spawn recon sandbox ──► nmap + gobuster ──► findings    │
-│       │                                                             │
-│       └──► for each finding:                                        │
-│              spawn exploit sandbox (parallel, asyncio)              │
-│                └──► success? ──► spawn deeper sandboxes (fanout)   │
-│                                                                     │
-│                         ▼                                           │
-│                  findings.json                                       │
-└─────────────────────────────────────────────────────────────────────┘
-                           │
-                           ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│                        BLUE TEAM                                    │
-│                                                                     │
-│  blue_team.py ──► read findings.json                               │
-│       │                                                             │
-│       └──► for each successful finding:                             │
-│              Claude agent (claude-sonnet-4-5-20251001)              │
-│                ├── read_file(path) tool                             │
-│                └── create_pr(branch, patches, desc) tool           │
-│                      └──► GitHub PR opened                          │
-└─────────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  HOST MACHINE                                                               │
+│                                                                             │
+│  OpenClaw (Node.js gateway)                                                 │
+│    reads skills/ → embeds into agent system prompt                         │
+│    agent calls exec("python3 orchestrator/red_team.py")                    │
+│         │                                                                   │
+│         ▼                                                                   │
+│  Jentic Mini (Docker, port 8900)                                            │
+│    credential vault — injects DAYTONA_API_KEY, ANTHROPIC_API_KEY,          │
+│    GITHUB_TOKEN at runtime so keys are never in skill files or code         │
+│         │                                                                   │
+│         ▼                                                                   │
+│  red_team.py (Python + Daytona SDK + asyncio)                               │
+│    │                                                                        │
+│    ├── Daytona API → target sandbox (Harbinger Flask app)                  │
+│    │     └── snapshot immediately → --reset restores this for demo replay  │
+│    │                                                                        │
+│    ├── Daytona API → recon sandbox                                          │
+│    │     └── nmap + gobuster → structured findings JSON                    │
+│    │                                                                        │
+│    └── Daytona API → exploit sandboxes (parallel, asyncio.gather)          │
+│          └── success? → fan out deeper sandboxes (capped at MAX_DEPTH=3)   │
+│                                                                             │
+│                      ▼                                                      │
+│               output/findings.json                                          │
+│                      │                                                      │
+│  blue_team.py (Python + Anthropic API raw tool_use + PyGithub)              │
+│    └── one Claude agent per finding                                         │
+│          ├── read_file tool → reads target/app.py                          │
+│          └── create_pr tool → GitHub PR with patch                         │
+│                      ▼                                                      │
+│               output/prs.json + GitHub PRs                                 │
+└─────────────────────────────────────────────────────────────────────────────┘
 ```
+
+## Target: Harbinger Inventory API
+
+A custom vulnerable Flask app (`target/app.py`) — NOT DVWA. Three subtle
+vulnerabilities that are not publicly documented, so the agent must actually
+probe to find them:
+
+| # | Endpoint | Technique | Subtlety |
+|---|----------|-----------|----------|
+| 1 | `GET /api/inventory?sort=` | SQL injection (ORDER BY clause) | The `query` param is safe (red herring); the `sort` param is injectable but starts with a valid column name |
+| 2 | `GET /api/report?name=` | Path traversal (os.path.join absolute-path bypass) | `..` is blocked but `/etc/passwd` as an absolute path silently discards the base dir |
+| 3 | `POST /api/diagnostics` | Command injection (incomplete blacklist) | Filter blocks `;`, `\|`, single `&`, `` ` ``, `$` but `&&` (as unicode escape `\u0026\u0026`) bypasses |
 
 ## Repository layout
 
 ```
 .
 ├── skills/
-│   ├── daytona-spawn/SKILL.md   # Skill: provision a Daytona sandbox
-│   ├── recon/SKILL.md           # Skill: nmap + gobuster recon
-│   └── exploit/SKILL.md         # Skill: targeted exploitation
+│   ├── daytona-spawn/SKILL.md   ← OpenClaw skill: provision a Daytona sandbox
+│   ├── recon/SKILL.md           ← OpenClaw skill: nmap + gobuster
+│   └── exploit/SKILL.md         ← OpenClaw skill: targeted exploitation + fan-out
 ├── target/
-│   ├── Dockerfile               # DVWA with verbose logging + auditd
-│   ├── audit.rules              # auditd syscall rules
-│   ├── process_watcher.sh       # Dumps procs every 5s to /var/log/procs.log
-│   └── entrypoint.sh            # Starts all services
+│   ├── app.py                   ← Harbinger vulnerable Flask app
+│   ├── Dockerfile               ← Flask + auditd + process watcher
+│   ├── requirements.txt
+│   ├── audit.rules              ← auditd syscall rules
+│   ├── process_watcher.sh       ← dumps ps/ss/lsof every 5s → /var/log/procs.log
+│   └── entrypoint.sh
 ├── sandbox-images/
-│   └── red.Dockerfile           # Attack tooling: nmap, gobuster, sqlmap, …
+│   ├── red.Dockerfile           ← nmap, gobuster, sqlmap, pwntools, curl
+│   └── openclaw-api-wordlist.txt
 ├── orchestrator/
-│   ├── red_team.py              # Red team orchestrator (asyncio + Daytona SDK)
-│   ├── blue_team.py             # Blue team orchestrator (Anthropic API + PyGithub)
+│   ├── red_team.py              ← full pipeline + snapshot/restore + --reset flag
+│   ├── blue_team.py             ← Anthropic tool_use agents + PyGithub PRs
 │   └── requirements.txt
+├── dvwa/                        ← git submodule (adam505x/DVWA_Daytona_Hackathon)
 ├── output/
-│   └── findings.json            # Schema + populated by red_team.py
+│   └── findings.json            ← schema + populated at runtime by red_team.py
+├── docker-compose.yml           ← Jentic Mini + target + red toolbox (local dev)
+├── Makefile
 ├── .env.example
 └── README.md
 ```
@@ -62,132 +89,119 @@ Autonomous security testing pipeline that **finds vulnerabilities** (red team) a
 
 ### 1. Prerequisites
 
+- [OpenClaw](https://github.com/openclaw/openclaw): `npm install -g openclaw@latest && openclaw onboard --install-daemon`
+- [Docker](https://docs.docker.com/get-docker/) (for images and Jentic Mini)
 - Python 3.11+
-- Docker (to build images)
 - A [Daytona](https://daytona.io) account and API key
 - An [Anthropic](https://console.anthropic.com) API key
-- A GitHub personal access token (`repo` scope)
+- A GitHub PAT with `repo` scope
 
-### 2. One-command setup and run
-
-```bash
-git clone <this-repo> && cd daytona_agent_hackathon && \
-cp .env.example .env && \
-# ── fill in .env (DAYTONA_API_KEY, ANTHROPIC_API_KEY, GITHUB_TOKEN, GITHUB_REPO, TARGET_REPO_PATH) ── \
-docker build -f sandbox-images/red.Dockerfile -t openclaw/red:latest . && \
-docker build -f target/Dockerfile -t openclaw/dvwa-target:latest ./target && \
-pip install -r orchestrator/requirements.txt && \
-python orchestrator/red_team.py && \
-python orchestrator/blue_team.py
-```
-
-### 3. Step-by-step
-
-#### Build the images
+### 2. One-command local smoke test
 
 ```bash
-# Red team attack image (used for all exploit sandboxes)
-docker build -f sandbox-images/red.Dockerfile -t openclaw/red:latest .
-
-# DVWA target with enhanced logging
-docker build -f target/Dockerfile -t openclaw/dvwa-target:latest ./target
+git clone --recurse-submodules <this-repo> && cd daytona_agent_hackathon
+cp .env.example .env              # fill in API keys
+make up                           # builds images, starts Jentic Mini + target + red toolbox
 ```
 
-Then push both images to a registry accessible from your Daytona environment, or
-set `TARGET_IMAGE` / `RED_IMAGE` in `.env` to point to existing public images.
+Harbinger API: http://localhost:5000
+Jentic Mini UI: http://localhost:8900
 
-#### Configure environment
+### 3. Set up Jentic Mini
 
 ```bash
-cp .env.example .env
-# Edit .env and fill in all required values
+# Open http://localhost:8900 in your browser
+# Add credentials:
+#   POST /credentials  { "api_id": "daytona", "values": { "api_key": "..." } }
+#   POST /credentials  { "api_id": "anthropic", "values": { "api_key": "..." } }
+#   POST /credentials  { "api_id": "github", "values": { "token": "..." } }
+# Generate a toolkit key → copy the tk_xxx value into .env as JENTIC_TOOLKIT_KEY
 ```
 
-#### Run the red team
+### 4. Install and configure OpenClaw
 
 ```bash
-python orchestrator/red_team.py
+openclaw onboard --install-daemon   # first time only
+# OpenClaw auto-discovers skills in ./skills/ when launched from this directory
+openclaw gateway --port 18789 --verbose
 ```
 
-This will:
-1. Provision a DVWA sandbox via Daytona
-2. Run recon (nmap + gobuster) from a separate sandbox
-3. Fan out parallel exploit sandboxes for every finding
-4. Recursively chase successful exploits (up to `MAX_DEPTH=3`)
-5. Write all findings to `output/findings.json`
+OpenClaw will find `skills/daytona-spawn/`, `skills/recon/`, and `skills/exploit/`
+and embed them into the agent's system prompt. Tell the agent:
 
-#### Run the blue team
+```
+"Run the red team pipeline against the Harbinger target"
+```
+
+OpenClaw will invoke the skills, calling `python3 orchestrator/red_team.py` via exec.
+
+### 5. Run standalone (without OpenClaw)
 
 ```bash
-python orchestrator/blue_team.py
-# or point at a custom findings file:
-python orchestrator/blue_team.py --findings /path/to/other_findings.json
+pip install -r orchestrator/requirements.txt
+
+# Full red team pipeline
+python3 orchestrator/red_team.py
+
+# Reset target to clean snapshot (for demo replay)
+python3 orchestrator/red_team.py --reset
+
+# Blue team (reads findings.json, opens GitHub PRs)
+python3 orchestrator/blue_team.py
 ```
 
-This will:
-1. Read `output/findings.json`
-2. Spawn one Claude agent per unique finding
-3. Each agent reads source files and crafts a minimal patch
-4. Opens a GitHub PR for each finding
-5. Writes PR URLs to `output/prs.json`
+### 6. Push images to a registry (required for Daytona)
 
-## Skills reference
-
-| Skill | Description |
-|---|---|
-| [daytona-spawn](skills/daytona-spawn/SKILL.md) | Provision a Daytona sandbox, wait for readiness, return `{sandbox_id, ip}` |
-| [recon](skills/recon/SKILL.md) | nmap full-port scan + gobuster path discovery → structured JSON |
-| [exploit](skills/exploit/SKILL.md) | Targeted exploitation (sqlmap, hydra, curl, …) with recursive fan-out |
-
-## `findings.json` schema
-
-```jsonc
-{
-  "run_id":              "uuid",
-  "timestamp":           "ISO-8601",
-  "target_ip":           "string",
-  "total_findings":      "int",
-  "successful_exploits": "int",
-  "findings": [
-    {
-      "id":           "uuid",
-      "type":         "sqli | path_traversal | file_upload | brute_force | …",
-      "severity":     "critical | high | medium | low",
-      "target":       "ip:port/path",
-      "success":      "bool",
-      "evidence":     { ... },
-      "raw_output":   "string (capped 5000 chars)",
-      "sandbox_id":   "daytona-sandbox-uuid",
-      "depth":        "int",
-      "deeper_vectors": [ ... ],
-      "error":        "string | null",
-      "timestamp":    "ISO-8601"
-    }
-  ]
-}
+```bash
+make push REGISTRY=docker.io/yourusername
+# Then set TARGET_IMAGE and RED_IMAGE in .env to point to your registry
 ```
 
-## Configuration reference
+## Demo replay
+
+After the first run, the target is snapshotted automatically.
+To replay the demo from a clean state:
+
+```bash
+python3 orchestrator/red_team.py --reset   # restores target from snapshot
+python3 orchestrator/red_team.py           # runs the pipeline again
+python3 orchestrator/blue_team.py          # opens PRs for new findings
+```
+
+## Makefile commands
+
+```
+make up          build all images + start local stack
+make down        stop and remove containers
+make shell-red   open a bash shell in the red toolbox
+make shell-target open a bash shell in the Harbinger target
+make logs        tail target access + process logs
+make install     pip install -r orchestrator/requirements.txt
+make red         run red_team.py
+make blue        run blue_team.py
+make push        push images to REGISTRY
+```
+
+## Configuration
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
 | `DAYTONA_API_KEY` | yes | — | Daytona API key |
-| `DAYTONA_API_URL` | no | `https://app.daytona.io/api` | Daytona server URL |
-| `TENSORIX_API_KEY` | yes | — | Tensorix API key (https://tensorix.ai) |
-| `TENSORIX_API_URL` | no | `https://api.tensorix.ai` | Tensorix inference endpoint |
-| `TENSORIX_MODEL` | no | `z-ai/glm-5` | Model for blue team agents (`z-ai/glm-5`, `kimi-k2.5`, `minimax-m2.5`, `deepseek-v3.1`) |
-| `GITHUB_TOKEN` | yes | — | GitHub PAT with `repo` scope |
-| `GITHUB_REPO` | yes | — | `owner/name` of the repo to open PRs against |
-| `TARGET_REPO_PATH` | yes | `.` | Local path to the target repo (for blue team file reads) |
-| `TARGET_IMAGE` | no | `vulnerables/web-dvwa:latest` | Docker image for DVWA target |
-| `RED_IMAGE` | no | `openclaw/red:latest` | Docker image for attack sandboxes |
-| `MAX_DEPTH` | no | `3` | Max exploit recursion depth |
-| `MAX_PARALLEL` | no | `10` | Max concurrent exploit sandboxes |
+| `DAYTONA_API_URL` | no | `https://app.daytona.io/api` | Daytona server |
+| `ANTHROPIC_API_KEY` | yes | — | Anthropic API key |
+| `BLUE_TEAM_MODEL` | no | `claude-sonnet-4-6` | Model for blue team agents |
+| `GITHUB_TOKEN` | yes | — | GitHub PAT (repo scope) |
+| `GITHUB_REPO` | yes | — | `owner/name` to open PRs against |
+| `TARGET_REPO_PATH` | no | `.` | Local repo path for blue team file reads |
+| `JENTIC_VAULT_KEY` | no | auto | Jentic Mini vault encryption key |
+| `JENTIC_TOOLKIT_KEY` | no | — | Jentic Mini agent toolkit key (`tk_xxx`) |
+| `TARGET_IMAGE` | no | `openclaw/target:latest` | Daytona target image |
+| `RED_IMAGE` | no | `openclaw/red:latest` | Daytona attack image |
+| `MAX_DEPTH` | no | `3` | Exploit fan-out recursion cap |
+| `MAX_PARALLEL` | no | `8` | Max concurrent exploit sandboxes |
+| `SNAPSHOT_NAME` | no | `openclaw-target-clean` | Name for --reset snapshot |
 
-## Security / ethics notice
+## Security notice
 
-This tooling is designed for **authorised security testing only**.
-- Never target systems you do not own or have explicit written permission to test.
-- The DVWA target is intentionally vulnerable and should only be run in isolated
-  network environments.
-- GitHub PRs will be opened against `GITHUB_REPO` — ensure this is a repo you control.
+This pipeline is for **authorised security testing only**. The Harbinger target
+contains intentional vulnerabilities. Never deploy it on a public network.

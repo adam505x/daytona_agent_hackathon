@@ -1,0 +1,93 @@
+# docker-compose.yml — local development stack
+#
+# Runs the full OpenClaw + Jentic Mini + target + red toolbox stack locally.
+#
+# Services:
+#   jentic-mini  — credential broker + API proxy (port 8900)
+#   target       — Harbinger vulnerable Flask app (port 5000)
+#   red          — attack toolbox container (interactive shell)
+#
+# OpenClaw is NOT in this compose file because it is a Node.js desktop app
+# installed on the host via npm. It connects to jentic-mini over localhost.
+#
+# Usage:
+#   docker compose up --build           # start everything
+#   docker compose exec red bash        # drop into the attack container
+#   docker compose exec target bash     # inspect the target
+#   docker compose down -v              # tear down
+
+services:
+
+  # ── Jentic Mini — credential broker ────────────────────────────────────────
+  # Stores API keys (Daytona, GitHub, Anthropic) in an encrypted vault.
+  # OpenClaw's jentic skill routes all API calls through here.
+  # UI at http://localhost:8900 — set up your credentials here first.
+  jentic-mini:
+    image: ghcr.io/jentic/jentic-mini:latest
+    container_name: openclaw-jentic
+    ports:
+      - "8900:8900"
+    volumes:
+      - jentic-data:/app/data
+    environment:
+      # JENTIC_VAULT_KEY is auto-generated on first start and stored in the volume.
+      # Set it explicitly here to make the vault portable across restarts.
+      JENTIC_VAULT_KEY: "${JENTIC_VAULT_KEY:-}"
+      LOG_LEVEL: "info"
+      # Set to "off" to disable telemetry contribution to Jentic's public catalog
+      JENTIC_TELEMETRY: "off"
+    networks:
+      - openclaw
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8900/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 15s
+
+  # ── Harbinger target — the intentionally vulnerable Flask app ───────────────
+  target:
+    build:
+      context: .
+      dockerfile: target/Dockerfile
+    image: openclaw/target:latest
+    container_name: openclaw-target
+    privileged: true     # needed for auditd syscall tracing
+    ports:
+      - "5000:5000"      # Flask app accessible at http://localhost:5000
+    volumes:
+      - target-logs:/var/log
+    networks:
+      - openclaw
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:5000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  # ── Red team toolbox — nmap, gobuster, sqlmap, etc. ─────────────────────────
+  red:
+    build:
+      context: .
+      dockerfile: sandbox-images/red.Dockerfile
+    image: openclaw/red:latest
+    container_name: openclaw-red
+    depends_on:
+      target:
+        condition: service_healthy
+    environment:
+      TARGET_IP: "target"   # Docker service name resolves to the target container
+    networks:
+      - openclaw
+    # Stay running so you can exec into it for manual testing
+    command: ["tail", "-f", "/dev/null"]
+
+volumes:
+  jentic-data:     # persists Jentic Mini's encrypted credential vault
+  target-logs:     # persists /var/log from the target for forensic review
+
+networks:
+  openclaw:
+    driver: bridge
